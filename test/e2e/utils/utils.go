@@ -17,6 +17,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/credentials"
+	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/route53"
 	"github.com/onsi/ginkgo/v2"
 	"github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
@@ -1046,11 +1050,6 @@ func getSecretAndAccessKeys() (accesskey, secretkey string) {
 	return accesskey, secretkey
 }
 
-// G204 lint issue for exec.command
-func SanitizeInput(input string) string {
-	return "\"" + strings.ReplaceAll(input, "\"", "\\\"") + "\""
-}
-
 func SetupLetsEncryptAccountSecret(ctx context.Context, kubeClient kubernetes.Interface) error {
 	const (
 		namespace  = "certman-operator"
@@ -1638,4 +1637,174 @@ func CleanupCertmanResources(ctx context.Context, dynamicClient dynamic.Interfac
 	}
 
 	return nil
+}
+
+// Route53 Helper Functions for DNS Validation
+
+// CreateRoute53Client creates AWS Route53 client from environment credentials
+func CreateRoute53Client() (*route53.Route53, error) {
+	awsAccessKey, awsSecretKey := getSecretAndAccessKeys()
+
+	if awsAccessKey == "" || awsSecretKey == "" {
+		return nil, fmt.Errorf("AWS credentials not found in environment variables")
+	}
+
+	sess, err := session.NewSession(&aws.Config{
+		Region: aws.String("us-east-1"), // Route53 is global, but SDK needs a region
+		Credentials: credentials.NewStaticCredentials(
+			awsAccessKey,
+			awsSecretKey,
+			"", // no session token needed for static credentials
+		),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create AWS session: %w", err)
+	}
+
+	return route53.New(sess), nil
+}
+
+// GetHostedZoneIDFromDNSZone extracts the Route53 hosted zone ID from a DNSZone resource
+func GetHostedZoneIDFromDNSZone(dnsZone *unstructured.Unstructured) (string, error) {
+	zoneID, found, err := unstructured.NestedString(dnsZone.Object, "status", "aws", "zoneID")
+	if err != nil {
+		return "", fmt.Errorf("error reading zoneID from DNSZone status: %w", err)
+	}
+	if !found {
+		return "", fmt.Errorf("zoneID not found in DNSZone status")
+	}
+
+	// Zone ID format: "/hostedzone/Z1234567890ABC"
+	// Extract just the ID part (Z1234567890ABC)
+	parts := strings.Split(zoneID, "/")
+	if len(parts) >= 3 {
+		return parts[2], nil
+	}
+
+	// If format is unexpected, return as-is
+	return zoneID, nil
+}
+
+// ListAcmeChallengeTXTRecords queries Route53 for _acme-challenge TXT records in a hosted zone
+func ListAcmeChallengeTXTRecords(client *route53.Route53, hostedZoneID string) ([]*route53.ResourceRecordSet, error) {
+	input := &route53.ListResourceRecordSetsInput{
+		HostedZoneId: aws.String(hostedZoneID),
+	}
+
+	result, err := client.ListResourceRecordSets(input)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list Route53 resource record sets: %w", err)
+	}
+
+	// Filter for _acme-challenge TXT records
+	var challengeRecords []*route53.ResourceRecordSet
+	for _, record := range result.ResourceRecordSets {
+		if record.Type != nil && *record.Type == "TXT" &&
+			record.Name != nil && strings.Contains(*record.Name, "_acme-challenge") {
+			challengeRecords = append(challengeRecords, record)
+		}
+	}
+
+	return challengeRecords, nil
+}
+
+// FindDNSZoneForClusterDeployment finds the DNSZone resource owned by a specific ClusterDeployment
+func FindDNSZoneForClusterDeployment(ctx context.Context, dynamicClient dynamic.Interface,
+	namespace, clusterDeploymentName string) (*unstructured.Unstructured, error) {
+
+	dnsZoneGVR := schema.GroupVersionResource{
+		Group:    "hive.openshift.io",
+		Version:  "v1",
+		Resource: "dnszones",
+	}
+
+	// List all DNSZones in the namespace
+	dnsZones, err := dynamicClient.Resource(dnsZoneGVR).Namespace(namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list DNSZones in namespace %s: %w", namespace, err)
+	}
+
+	// Find DNSZone owned by our ClusterDeployment
+	for i := range dnsZones.Items {
+		dnsZone := &dnsZones.Items[i]
+
+		// Check owner references
+		ownerRefs := dnsZone.GetOwnerReferences()
+		for _, ownerRef := range ownerRefs {
+			if ownerRef.Kind == "ClusterDeployment" && ownerRef.Name == clusterDeploymentName {
+				return dnsZone, nil
+			}
+		}
+	}
+
+	return nil, fmt.Errorf("DNSZone not found for ClusterDeployment %s in namespace %s",
+		clusterDeploymentName, namespace)
+}
+
+// VerifyDNSZoneReady checks if a DNSZone has the ZoneAvailable condition set to True
+func VerifyDNSZoneReady(dnsZone *unstructured.Unstructured) (bool, error) {
+	conditions, found, err := unstructured.NestedSlice(dnsZone.Object, "status", "conditions")
+	if err != nil {
+		return false, fmt.Errorf("error reading DNSZone conditions: %w", err)
+	}
+	if !found {
+		return false, nil
+	}
+
+	for _, cond := range conditions {
+		condMap, ok := cond.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		condType, _ := condMap["type"].(string)
+		condStatus, _ := condMap["status"].(string)
+
+		if condType == "ZoneAvailable" && condStatus == "True" {
+			return true, nil
+		}
+	}
+
+	return false, nil
+}
+
+// ParseCertificateFromSecret extracts and parses the x509 certificate from a Kubernetes TLS secret
+func ParseCertificateFromSecret(secret *corev1.Secret) (*x509.Certificate, error) {
+	certData, ok := secret.Data["tls.crt"]
+	if !ok || len(certData) == 0 {
+		return nil, fmt.Errorf("secret does not contain tls.crt data")
+	}
+
+	block, _ := pem.Decode(certData)
+	if block == nil {
+		return nil, fmt.Errorf("failed to decode PEM block from certificate data")
+	}
+
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse certificate: %w", err)
+	}
+
+	return cert, nil
+}
+
+// VerifyCertificateExpiry checks if a certificate is currently valid (not expired, not yet valid)
+func VerifyCertificateExpiry(cert *x509.Certificate) error {
+	now := time.Now()
+
+	if now.Before(cert.NotBefore) {
+		return fmt.Errorf("certificate is not yet valid (NotBefore: %v, now: %v)", cert.NotBefore, now)
+	}
+
+	if now.After(cert.NotAfter) {
+		return fmt.Errorf("certificate has expired (NotAfter: %v, now: %v)", cert.NotAfter, now)
+	}
+
+	return nil
+}
+
+// GetCertificateRemainingDays returns the number of days remaining until certificate expiry
+func GetCertificateRemainingDays(cert *x509.Certificate) int {
+	duration := time.Until(cert.NotAfter)
+	return int(duration.Hours() / 24)
 }

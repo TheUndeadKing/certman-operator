@@ -6,13 +6,12 @@ package osde2etests
 
 import (
 	"context"
-	"crypto/x509"
 	"encoding/json"
-	"encoding/pem"
 	"fmt"
 	"strings"
 	"time"
 
+	"github.com/aws/aws-sdk-go/service/route53"
 	"github.com/onsi/ginkgo/v2"
 	"github.com/onsi/gomega"
 	utils "github.com/openshift/certman-operator/test/e2e/utils"
@@ -20,7 +19,6 @@ import (
 	"github.com/openshift/osde2e-common/pkg/clients/openshift"
 	corev1 "k8s.io/api/core/v1"
 	apiextensionsclient "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
-	"k8s.io/apimachinery/pkg/api/errors"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
@@ -55,13 +53,12 @@ var _ = ginkgo.Describe("Certman Operator", ginkgo.Ordered, ginkgo.ContinueOnFai
 	)
 
 	const (
-		pollingDuration            = 5 * time.Minute
-		shortTimeout               = 5 * time.Minute
-		testTimeout                = 10 * time.Minute
-		namespace                  = "openshift-config"
-		namespace_certman_operator = "certman-operator"
-		operatorNS                 = "certman-operator"
-		awsSecretName              = "aws"
+		pollingDuration = 5 * time.Minute
+		shortTimeout    = 5 * time.Minute
+		testTimeout     = 10 * time.Minute
+		namespace       = "openshift-config"
+		operatorNS      = "certman-operator"
+		awsSecretName   = "aws"
 	)
 
 	ginkgo.BeforeAll(func(ctx context.Context) {
@@ -443,6 +440,113 @@ var _ = ginkgo.Describe("Certman Operator", ginkgo.Ordered, ginkgo.ContinueOnFai
 			"crName", foundCertificateRequest.GetName())
 	})
 
+	ginkgo.It("should create TXT records in Route53 for DNS-01 challenge", func(ctx context.Context) {
+		// Find the DNSZone for our cluster
+		dnsZone, err := utils.FindDNSZoneForClusterDeployment(ctx, dynamicClient,
+			certConfig.TestNamespace, clusterDeploymentName)
+		gomega.Expect(err).ShouldNot(gomega.HaveOccurred(), "DNSZone should exist for ClusterDeployment")
+
+		// Verify DNSZone is ready before querying Route53
+		gomega.Eventually(func() bool {
+			// Re-fetch DNSZone to get latest status
+			freshDNSZone, err := utils.FindDNSZoneForClusterDeployment(ctx, dynamicClient,
+				certConfig.TestNamespace, clusterDeploymentName)
+			if err != nil {
+				return false
+			}
+			ready, err := utils.VerifyDNSZoneReady(freshDNSZone)
+			if err != nil {
+				ginkgo.GinkgoLogr.Error(err, "Error checking DNSZone readiness")
+				return false
+			}
+			if !ready {
+				ginkgo.GinkgoLogr.Info("DNSZone not ready yet, waiting...")
+			} else {
+				// Update dnsZone with fresh data when ready
+				dnsZone = freshDNSZone
+			}
+			return ready
+		}, 5*time.Minute, 10*time.Second).Should(gomega.BeTrue(), "DNSZone should be ready")
+
+		// Get hosted zone ID from DNSZone status
+		hostedZoneID, err := utils.GetHostedZoneIDFromDNSZone(dnsZone)
+		gomega.Expect(err).ShouldNot(gomega.HaveOccurred(), "Should extract zone ID from DNSZone")
+
+		ginkgo.GinkgoLogr.Info("Testing Route53 DNS records",
+			"hostedZoneID", hostedZoneID,
+			"namespace", certConfig.TestNamespace)
+
+		// Create Route53 client
+		route53Client, err := utils.CreateRoute53Client()
+		gomega.Expect(err).ShouldNot(gomega.HaveOccurred(), "Should create Route53 client")
+
+		// Find the CertificateRequest
+		certificateRequest, err := utils.FindCertificateRequestForClusterDeployment(ctx, dynamicClient,
+			certificateRequestGVR, certConfig.TestNamespace, clusterDeploymentName)
+		gomega.Expect(err).ShouldNot(gomega.HaveOccurred(), "CertificateRequest should exist")
+
+		// Get expected DNS names
+		dnsNames, found, err := unstructured.NestedStringSlice(certificateRequest.Object, "spec", "dnsNames")
+		gomega.Expect(err).ShouldNot(gomega.HaveOccurred())
+		gomega.Expect(found).To(gomega.BeTrue(), "CertificateRequest should have dnsNames")
+		gomega.Expect(len(dnsNames)).To(gomega.BeNumerically(">", 0), "Should have at least one DNS name")
+
+		ginkgo.GinkgoLogr.Info("Expected DNS names", "dnsNames", dnsNames)
+
+		// Wait for TXT records to be created in Route53
+		var challengeRecords []*route53.ResourceRecordSet
+		gomega.Eventually(func() bool {
+			records, err := utils.ListAcmeChallengeTXTRecords(route53Client, hostedZoneID)
+			if err != nil {
+				ginkgo.GinkgoLogr.Error(err, "Failed to list Route53 records")
+				return false
+			}
+
+			if len(records) == 0 {
+				ginkgo.GinkgoLogr.Info("No _acme-challenge TXT records found yet, waiting...")
+				return false
+			}
+
+			challengeRecords = records
+			ginkgo.GinkgoLogr.Info("Found _acme-challenge TXT records",
+				"count", len(records))
+
+			// Verify we have records for our domains
+			for _, record := range records {
+				ginkgo.GinkgoLogr.Info("Found TXT record",
+					"name", *record.Name,
+					"type", *record.Type,
+					"ttl", *record.TTL)
+			}
+
+			return true
+		}, 10*time.Minute, 15*time.Second).Should(gomega.BeTrue(),
+			"TXT records should be created in Route53 for DNS-01 challenge")
+
+		// Validate record format
+		for _, record := range challengeRecords {
+			// Verify it's a TXT record
+			gomega.Expect(*record.Type).To(gomega.Equal("TXT"), "Record should be TXT type")
+
+			// Verify name starts with _acme-challenge
+			gomega.Expect(*record.Name).To(gomega.ContainSubstring("_acme-challenge"),
+				"Record name should contain _acme-challenge")
+
+			// Verify TTL is reasonable (usually 60 seconds for ACME challenges)
+			gomega.Expect(*record.TTL).To(gomega.BeNumerically("<=", 300),
+				"TTL should be short for challenge records")
+
+			// Verify record has a value
+			gomega.Expect(len(record.ResourceRecords)).To(gomega.BeNumerically(">", 0),
+				"TXT record should have a value")
+
+			ginkgo.GinkgoLogr.Info("✅ TXT record validated",
+				"name", *record.Name,
+				"ttl", *record.TTL,
+				"value", *record.ResourceRecords[0].Value)
+		}
+	})
+
 	ginkgo.It("should verify primary-cert-bundle-secret and certificate creation", func(ctx context.Context) {
 		// Find the CertificateRequest for our ClusterDeployment
 		certificateRequest, err := utils.FindCertificateRequestForClusterDeployment(ctx, dynamicClient, certificateRequestGVR,
@@ -505,14 +609,165 @@ var _ = ginkgo.Describe("Certman Operator", ginkgo.Ordered, ginkgo.ContinueOnFai
 		}, testTimeout, 15*time.Second).Should(gomega.BeTrue(), "primary-cert-bundle-secret should be created with certificate data")
 
 		// Verify certificate is valid
-		block, _ := pem.Decode(secret.Data["tls.crt"])
-		gomega.Expect(block).ToNot(gomega.BeNil(), "Certificate should be valid PEM")
-		cert, err := x509.ParseCertificate(block.Bytes)
+		cert, err := utils.ParseCertificateFromSecret(secret)
 		gomega.Expect(err).ShouldNot(gomega.HaveOccurred(), "Certificate should be parseable")
+
+		// Verify certificate is not expired and currently valid
+		err = utils.VerifyCertificateExpiry(cert)
+		gomega.Expect(err).ShouldNot(gomega.HaveOccurred(), "Certificate should be currently valid")
+
+		// Get remaining days until expiry
+		remainingDays := utils.GetCertificateRemainingDays(cert)
+		gomega.Expect(remainingDays).To(gomega.BeNumerically(">", 0),
+			"Certificate should have positive remaining days")
+
+		// Get expected DNS names from CertificateRequest spec
+		expectedDNSNames, found, err := unstructured.NestedStringSlice(certificateRequest.Object, "spec", "dnsNames")
+		gomega.Expect(err).ShouldNot(gomega.HaveOccurred())
+		gomega.Expect(found).To(gomega.BeTrue())
+
+		// Verify certificate has at least 2 DNS names (api and apps)
+		gomega.Expect(len(cert.DNSNames)).To(gomega.BeNumerically(">=", 2),
+			"Certificate should have at least 2 DNS names (api and apps)")
+
+		// Verify certificate has all expected DNS names
+		for _, expectedDNS := range expectedDNSNames {
+			found := false
+			for _, certDNS := range cert.DNSNames {
+				if certDNS == expectedDNS {
+					found = true
+					break
+				}
+			}
+			gomega.Expect(found).To(gomega.BeTrue(),
+				fmt.Sprintf("Certificate should contain DNS name: %s", expectedDNS))
+		}
 
 		ginkgo.GinkgoLogr.Info("Certificate and primary-cert-bundle-secret verified successfully",
 			"secretName", certificateSecretName,
-			"dnsNames", cert.DNSNames)
+			"dnsNames", cert.DNSNames,
+			"NotBefore", cert.NotBefore,
+			"NotAfter", cert.NotAfter,
+			"RemainingDays", remainingDays)
+	})
+
+	ginkgo.It("should delete TXT records from Route53 after certificate issuance", func(ctx context.Context) {
+		// Find the DNSZone
+		dnsZone, err := utils.FindDNSZoneForClusterDeployment(ctx, dynamicClient,
+			certConfig.TestNamespace, clusterDeploymentName)
+		gomega.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+		// Verify DNSZone is ready
+		gomega.Eventually(func() bool {
+			freshDNSZone, err := utils.FindDNSZoneForClusterDeployment(ctx, dynamicClient,
+				certConfig.TestNamespace, clusterDeploymentName)
+			if err != nil {
+				return false
+			}
+			ready, err := utils.VerifyDNSZoneReady(freshDNSZone)
+			if err != nil {
+				return false
+			}
+			if ready {
+				dnsZone = freshDNSZone
+			}
+			return ready
+		}, 5*time.Minute, 10*time.Second).Should(gomega.BeTrue(), "DNSZone should be ready")
+
+		// Get hosted zone ID
+		hostedZoneID, err := utils.GetHostedZoneIDFromDNSZone(dnsZone)
+		gomega.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+		// Create Route53 client
+		route53Client, err := utils.CreateRoute53Client()
+		gomega.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+		// Wait for certificate to be issued
+		gomega.Eventually(func() bool {
+			certificateRequest, err := utils.FindCertificateRequestForClusterDeployment(ctx, dynamicClient,
+				certificateRequestGVR, certConfig.TestNamespace, clusterDeploymentName)
+			if err != nil {
+				return false
+			}
+
+			issued, found, _ := unstructured.NestedBool(certificateRequest.Object, "status", "issued")
+			if !found {
+				return false
+			}
+
+			if issued {
+				ginkgo.GinkgoLogr.Info("✅ Certificate issued, checking for TXT record cleanup...")
+			}
+
+			return issued
+		}, 15*time.Minute, 15*time.Second).Should(gomega.BeTrue(),
+			"Certificate should be issued before checking cleanup")
+
+		// Verify TXT records are DELETED after certificate issuance
+		gomega.Eventually(func() bool {
+			records, err := utils.ListAcmeChallengeTXTRecords(route53Client, hostedZoneID)
+			if err != nil {
+				ginkgo.GinkgoLogr.Error(err, "Failed to list Route53 records")
+				return false
+			}
+
+			if len(records) > 0 {
+				ginkgo.GinkgoLogr.Info("Challenge TXT records still exist, waiting for cleanup...",
+					"count", len(records))
+				for _, record := range records {
+					ginkgo.GinkgoLogr.Info("Orphaned record",
+						"name", *record.Name)
+				}
+				return false
+			}
+
+			ginkgo.GinkgoLogr.Info("✅ All _acme-challenge TXT records cleaned up")
+			return true
+		}, 5*time.Minute, 10*time.Second).Should(gomega.BeTrue(),
+			"TXT records should be deleted from Route53 after certificate issuance")
+
+		// Test certificate renewal by deleting and recreating the secret
+		ginkgo.GinkgoLogr.Info("Testing certificate renewal simulation")
+
+		certificateRequest, err := utils.FindCertificateRequestForClusterDeployment(ctx, dynamicClient,
+			certificateRequestGVR, certConfig.TestNamespace, clusterDeploymentName)
+		gomega.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+		certificateSecretName, err := utils.GetCertificateSecretNameFromCR(certificateRequest)
+		gomega.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+		// Get original secret creation time
+		originalSecret, err := clientset.CoreV1().Secrets(certConfig.TestNamespace).Get(ctx, certificateSecretName, metav1.GetOptions{})
+		gomega.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+		originalCreationTime := originalSecret.CreationTimestamp.Time
+
+		// Delete certificate secret to simulate renewal
+		ginkgo.GinkgoLogr.Info("Deleting certificate secret to simulate renewal", "secret", certificateSecretName)
+		err = clientset.CoreV1().Secrets(certConfig.TestNamespace).Delete(ctx, certificateSecretName, metav1.DeleteOptions{})
+		gomega.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+		// Wait for secret to be recreated
+		gomega.Eventually(func() bool {
+			newSecret, err := clientset.CoreV1().Secrets(certConfig.TestNamespace).Get(ctx, certificateSecretName, metav1.GetOptions{})
+			if err != nil || len(newSecret.Data["tls.crt"]) == 0 {
+				return false
+			}
+			return newSecret.CreationTimestamp.Time.After(originalCreationTime)
+		}, 10*time.Minute, 15*time.Second).Should(gomega.BeTrue(),
+			"Certificate secret should be recreated after deletion (renewal)")
+
+		// Verify renewed certificate is valid
+		renewedSecret, err := clientset.CoreV1().Secrets(certConfig.TestNamespace).Get(ctx, certificateSecretName, metav1.GetOptions{})
+		gomega.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+		renewedCert, err := utils.ParseCertificateFromSecret(renewedSecret)
+		gomega.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+		err = utils.VerifyCertificateExpiry(renewedCert)
+		gomega.Expect(err).ShouldNot(gomega.HaveOccurred(), "Renewed certificate should be valid")
+
+		ginkgo.GinkgoLogr.Info("✅ Certificate renewal simulation completed successfully")
 	})
 
 	ginkgo.It("should verify certificate operation metrics", func(ctx context.Context) {
@@ -599,8 +854,8 @@ var _ = ginkgo.Describe("Certman Operator", ginkgo.Ordered, ginkgo.ContinueOnFai
 		pollingDuration := 2 * time.Minute
 		pollInterval := 30 * time.Second
 
-		originalSecret, err := clientset.CoreV1().Secrets(namespace_certman_operator).Get(ctx, secretNameToDelete, metav1.GetOptions{})
-		if errors.IsNotFound(err) {
+		originalSecret, err := clientset.CoreV1().Secrets(operatorNS).Get(ctx, secretNameToDelete, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
 			log.Log.Info("Secret does not exist, skipping deletion test.")
 			return
 		}
@@ -609,11 +864,11 @@ var _ = ginkgo.Describe("Certman Operator", ginkgo.Ordered, ginkgo.ContinueOnFai
 		originalTimestamp := originalSecret.CreationTimestamp.Time
 		log.Log.Info(fmt.Sprintf("Original secret creation timestamp: %v", originalTimestamp))
 
-		err = clientset.CoreV1().Secrets(namespace_certman_operator).Delete(ctx, secretNameToDelete, metav1.DeleteOptions{})
+		err = clientset.CoreV1().Secrets(operatorNS).Delete(ctx, secretNameToDelete, metav1.DeleteOptions{})
 		gomega.Expect(err).ShouldNot(gomega.HaveOccurred(), "Failed to delete the secret")
 
 		gomega.Eventually(func() bool {
-			newSecret, err := clientset.CoreV1().Secrets(namespace_certman_operator).Get(ctx, secretNameToDelete, metav1.GetOptions{})
+			newSecret, err := clientset.CoreV1().Secrets(operatorNS).Get(ctx, secretNameToDelete, metav1.GetOptions{})
 			if err != nil {
 				return false
 			}
